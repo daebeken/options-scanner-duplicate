@@ -1,0 +1,6 @@
+ibapi>=9.81
+pandas>=2.0
+numpy>=1.24
+pyyaml>=6.0
+polars>=0.20
+azure-storage-blob>=12.20

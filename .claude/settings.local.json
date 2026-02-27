@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:www.interactivebrokers.com)",
+      "WebFetch(domain:ibkrcampus.com)",
+      "WebFetch(domain:interactivebrokers.github.io)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(.venv/Scripts/pip.exe install:*)"
+    ]
+  }
+}

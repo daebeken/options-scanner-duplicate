@@ -1,0 +1,39 @@
+# IBKR TWS API Options Scanner Configuration
+
+tws:
+  host: "127.0.0.1"
+  port: 7496          # 7497=paper, 7496=live TWS, 4001=IB Gateway live, 4002=IB Gateway paper
+  client_id: 1
+
+# Symbols file: one ticker per line
+symbols_file: "symbols.txt"
+
+# Market data type: 1=live, 2=frozen, 3=delayed, 4=delayed-frozen
+market_data_type: 1
+
+# Constant maturity IV tenors (days)
+tenors:
+  - 30
+  - 180
+expiries_per_tenor: 2          # nearest expiries around each tenor (typically below+above)
+prevalidate_contracts: true    # check option contracts via reqContractDetails before reqMktData
+prevalidation_fallback_unvalidated: false  # when false, do not request unvalidated contracts
+
+# Scan speed tuning
+batch_size: 200                  # max simultaneous market data subscriptions per batch
+rate_limit: 0.03                 # seconds between each reqMktData call
+max_strikes_per_expiry: 2        # number of strikes per selected expiry kept for requests
+prevalidation_candidate_factor: 2  # candidate multiplier used before contract prevalidation
+
+# Filters (from the academic paper methodology)
+filters:
+  min_abs_delta: 0.35          # |delta| lower bound
+  max_abs_delta: 0.65          # |delta| upper bound
+  min_iv: 0.03                 # IV lower bound (3%)
+  max_iv: 2.0                  # IV upper bound (200%)
+
+# Output
+output:
+  raw_data: "data/raw_options.csv"
+  atm_iv: "data/atm_iv.csv"
+  constant_maturity: "data/constant_maturity_iv.csv"
