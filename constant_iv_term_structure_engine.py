@@ -11,6 +11,7 @@ import polars as pl
 import duckdb
 from matplotlib import pyplot as plt
 from massive import RESTClient
+from extract_orats import ExtractOratsEngine
 
 load_dotenv()
 
@@ -78,6 +79,7 @@ class constantIVTermStructureEngine:
         target_frequency: Optional[str] = None,
         rank_column: Optional[str] = None,
         n_tiles: Optional[int] = None,
+        auto_sync: bool = True,
     ) -> None:
         if isinstance(ticker, str):
             self.tickers = [ticker.upper()]
@@ -94,6 +96,8 @@ class constantIVTermStructureEngine:
         self.target_frequency = target_frequency or os.getenv("TARGET_FREQUENCY", "d")
         self.rank_column = rank_column or os.getenv("RANK_COLUMN", "SLOPE")
         self.n_tiles = n_tiles or int(os.getenv("N_TILES", "10"))
+
+        self.auto_sync = auto_sync
 
         self.options_cfg = self._build_config(OptionsFilterConfig, options_filter_config)
         self.equity_cfg = self._build_config(EquityFilterConfig, equity_filter_config)
@@ -113,6 +117,16 @@ class constantIVTermStructureEngine:
         if self._client is None:
             self._client = RESTClient(self.massive_api_key)
         return self._client
+
+    # Step 0: Sync ORATS cache so options data is up to date
+    def _sync_orats_cache(self) -> None:
+        """Sync the ORATS DuckDB cache for the current and previous year."""
+        year = date.today().year
+        print("[SYNC] Syncing ORATS cache...")
+        with ExtractOratsEngine(db_path=self.db_path) as orats:
+            for y in [year - 1, year]:
+                orats.sync_year_sequential(y, verbose=True)
+        print("[SYNC] ORATS cache is up to date.")
 
     # Step 1: Fetch equity data from Massive API
     def _fetch_equity_data(self) -> pl.DataFrame:
@@ -647,6 +661,9 @@ class constantIVTermStructureEngine:
         If ticker is a single string, runs sequentially.
         If ticker is a list, runs in parallel across all CPU cores.
         """
+        if self.auto_sync:
+            self._sync_orats_cache()
+
         if len(self.tickers) == 1:
             result = self._run_single()
         else:
@@ -677,6 +694,7 @@ def _worker_run_ticker(args: tuple) -> Optional[pl.DataFrame]:
             target_frequency=freq,
             rank_column=rank_col,
             n_tiles=n_tiles,
+            auto_sync=False,  # sync already done in main process
         )
         return engine._run_single()
     except Exception as e:
