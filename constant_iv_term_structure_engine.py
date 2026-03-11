@@ -2,11 +2,17 @@ from datetime import date, timedelta, datetime
 from typing import Optional, Dict, Any, List, Union
 from dataclasses import dataclass
 import multiprocessing as mp
+import math
+import os
 
+from dotenv import load_dotenv
 import numpy as np
 import polars as pl
 import duckdb
+from matplotlib import pyplot as plt
 from massive import RESTClient
+
+load_dotenv()
 
 
 @dataclass
@@ -58,6 +64,8 @@ class constantIVTermStructureEngine:
         "time": "timestamp",
     }
 
+    _FREQ_SHIFT_MAP = {"d": 1, "w": 5, "y": 252}
+
     def __init__(
         self,
         ticker: Union[str, List[str]],
@@ -67,6 +75,9 @@ class constantIVTermStructureEngine:
         equity_filter_config: Optional[Dict[str, Any]] = None,
         max_history_days: int = 50000,
         tenors: Optional[List[int]] = None,
+        target_frequency: Optional[str] = None,
+        rank_column: Optional[str] = None,
+        n_tiles: Optional[int] = None,
     ) -> None:
         if isinstance(ticker, str):
             self.tickers = [ticker.upper()]
@@ -78,6 +89,11 @@ class constantIVTermStructureEngine:
         self.db_path = db_path
         self.max_history_days = max_history_days
         self.tenors = tenors or [30, 180]
+
+        # Read from .env if not explicitly provided
+        self.target_frequency = target_frequency or os.getenv("TARGET_FREQUENCY", "d")
+        self.rank_column = rank_column or os.getenv("RANK_COLUMN", "SLOPE")
+        self.n_tiles = n_tiles or int(os.getenv("N_TILES", "10"))
 
         self.options_cfg = self._build_config(OptionsFilterConfig, options_filter_config)
         self.equity_cfg = self._build_config(EquityFilterConfig, equity_filter_config)
@@ -215,6 +231,10 @@ class constantIVTermStructureEngine:
             ((pl.col("cMidIv") + pl.col("pMidIv")) / 2).alias("atm_iv"),
             (pl.col("expirDate").cast(pl.Date) - pl.lit(datetime.now().date()))
                 .dt.total_days().alias("days_to_expiry"),
+            pl.min_horizontal("cVolu", "pVolu").alias("min_leg_volume"),
+            (pl.col("cVolu") + pl.col("pVolu")).alias("total_volume"),
+            pl.min_horizontal("cOi", "pOi").alias("min_leg_oi"),
+            (pl.col("cOi") + pl.col("pOi")).alias("total_oi"),
         )
 
     # Step 7: Constant-maturity IV interpolation
@@ -278,6 +298,8 @@ class constantIVTermStructureEngine:
         return joined.select([
             "ticker", "expirDate", "trade_date", "cOpra", "pOpra",
             "cBidPx", "cAskPx", "pBidPx", "pAskPx",
+            "cVolu", "pVolu", "cOi", "pOi",
+            "min_leg_volume", "total_volume", "min_leg_oi", "total_oi",
         ] + tenor_cols)
 
     # Step 9: Join with equity data
@@ -310,20 +332,227 @@ class constantIVTermStructureEngine:
             ((pl.col("RVLT") - pl.col(iv_short)) / pl.col("RVLT")).alias("IVRV_SLOPE"),
             (pl.col("cBidPx") + pl.col("pBidPx")).alias("straddle_price_bid"),
             (pl.col("cAskPx") + pl.col("pAskPx")).alias("straddle_price_ask"),
-            ((pl.col("cBidPx") + pl.col("pBidPx") +
-              pl.col("cAskPx") + pl.col("pAskPx")) / 2).alias("straddle_price_mid"),
+            ((pl.col("cBidPx") + pl.col("pBidPx") + pl.col("cAskPx") + pl.col("pAskPx")) / 2).alias("straddle_price_mid"),
+            ((pl.col("cAskPx") + pl.col("pAskPx")) - (pl.col("cBidPx") + pl.col("pBidPx"))).alias("spread_abs"),
+            (((pl.col("cAskPx") + pl.col("pAskPx")) - (pl.col("cBidPx") + pl.col("pBidPx")))
+             / ((pl.col("cBidPx") + pl.col("pBidPx") + pl.col("cAskPx") + pl.col("pAskPx")) / 2)).alias("spread_pct_mid"),
         )
 
     # Step 11: Final selection + wret
     def _select_final_and_compute_wret(self, df: pl.DataFrame) -> pl.DataFrame:
-        return df.select([
+        shift_n = self._FREQ_SHIFT_MAP.get(self.target_frequency, 1)
+
+        result = df.select([
             "ticker", "expirDate", "trade_date", "cOpra", "pOpra",
+            "cVolu", "pVolu", "cOi", "pOi",
+            "min_leg_volume", "total_volume", "min_leg_oi", "total_oi",
             "dollar_vol", "SLOPE", "IVRV_SLOPE",
             "straddle_price_bid", "straddle_price_ask", "straddle_price_mid",
+            "spread_abs", "spread_pct_mid",
         ]).with_columns(
-            (pl.col("straddle_price_bid").shift(-1).over("ticker")
+            (pl.col("straddle_price_bid").shift(-shift_n).over("ticker")
              / pl.col("straddle_price_ask") - 1).alias("wret"),
         )
+
+        return result
+
+    @staticmethod
+    def add_ntile(
+        df: pl.DataFrame,
+        col: str,
+        n: int,
+        by: str,
+        output_col: Optional[str] = None,
+    ) -> pl.DataFrame:
+        """Add ntile (quantile bucket) column.
+
+        Matches R: weekly_slice[, q_iv := ntile(IV_SLOPE, 10), by = trade_date]
+        ntile formula: ceiling(rank / count * n)
+        """
+        if output_col is None:
+            output_col = f"q_{col.lower()}"
+
+        df = df.with_columns(
+            (
+                (pl.col(col).rank("ordinal").over(by) / pl.col(col).count().over(by) * n)
+                .ceil()
+                .cast(pl.Int32)
+            ).alias(output_col)
+        )
+
+        return df
+
+    # Step 12: Trade execution — compute returns across fill grid
+    def trade_execution(self, df: pl.DataFrame) -> pl.DataFrame:
+        """
+        Compute next-day straddle prices and returns across an execution quality grid.
+
+        SPREAD_CHOICE (from .env):
+            - PARTIAL: slippage from mid toward bid/ask (half spread)
+            - FULL: slippage across the full bid-ask spread
+
+        For each fill level f in [0, 1]:
+            PARTIAL:
+                - f=0: execute at mid, f=1: execute at bid/ask
+            FULL:
+                - f=0: worst (long buys at ask, sells at next_bid; short sells at bid, buys at next_ask)
+                - f=1: best (long buys at bid, sells at next_ask; short sells at ask, buys at next_bid)
+
+        Input:
+            df (pl.DataFrame): Must contain columns: ticker, expirDate, trade_date, cOpra, pOpra,
+                               straddle_price_bid, straddle_price_ask, straddle_price_mid, q_slope
+
+        Output:
+            pl.DataFrame: Original columns plus next_mid, next_bid, next_ask,
+                          ret_fill_XX and short_ret_fill_XX for each fill level
+        """
+        spread_choice = os.getenv("SPREAD_CHOICE", "PARTIAL")
+
+        # select relevant columns
+        df = df.select("ticker", "expirDate", "trade_date", "cOpra", "pOpra", "straddle_price_bid", "straddle_price_ask", "straddle_price_mid", "q_slope")
+
+        # Compute next-day straddle prices per ticker
+        df = df.with_columns([
+            pl.col("straddle_price_mid").shift(-1).over("ticker").alias("next_mid"),
+            pl.col("straddle_price_bid").shift(-1).over("ticker").alias("next_bid"),
+            pl.col("straddle_price_ask").shift(-1).over("ticker").alias("next_ask"),
+        ])
+
+        # Compute returns across execution quality grid
+        n_grid = int(os.getenv("N_GRID", "10"))
+        fill_grid = np.linspace(0, 1, n_grid)
+
+        ret_cols = []
+        short_ret_cols = []
+
+        for f in fill_grid:
+            fill_pct = int(round(f * 100))
+            ret_col = f"ret_fill_{fill_pct:02d}"
+            short_ret_col = f"short_ret_fill_{fill_pct:02d}"
+
+            if spread_choice == "FULL":
+                # Long: f=0 buy at ask (worst), f=1 buy at bid (best)
+                entry_long = pl.col("straddle_price_ask") - f * (pl.col("straddle_price_ask") - pl.col("straddle_price_bid"))
+                # f=0 sell at next_bid (worst), f=1 sell at next_ask (best)
+                exit_long = pl.col("next_bid") + f * (pl.col("next_ask") - pl.col("next_bid"))
+
+                # Short: f=0 sell at bid (worst), f=1 sell at ask (best)
+                entry_short = pl.col("straddle_price_bid") + f * (pl.col("straddle_price_ask") - pl.col("straddle_price_bid"))
+                # f=0 buy back at next_ask (worst), f=1 buy back at next_bid (best)
+                exit_short = pl.col("next_ask") - f * (pl.col("next_ask") - pl.col("next_bid"))
+            else:
+                # Long: buy at mid + slippage toward ask, sell at next_mid - slippage toward next_bid
+                entry_long = pl.col("straddle_price_mid") + f * (pl.col("straddle_price_ask") - pl.col("straddle_price_mid"))
+                exit_long = pl.col("next_mid") - f * (pl.col("next_mid") - pl.col("next_bid"))
+
+                # Short: sell at mid - slippage toward bid, buy back at next_mid + slippage toward next_ask
+                entry_short = pl.col("straddle_price_mid") - f * (pl.col("straddle_price_mid") - pl.col("straddle_price_bid"))
+                exit_short = pl.col("next_mid") + f * (pl.col("next_ask") - pl.col("next_mid"))
+
+            ret_cols.append(
+                pl.when(entry_long.abs() > 1e-10)
+                .then(exit_long / entry_long - 1)
+                .otherwise(None)
+                .alias(ret_col)
+            )
+
+            short_ret_cols.append(
+                pl.when(exit_short.abs() > 1e-10)
+                .then(entry_short / exit_short - 1)
+                .otherwise(None)
+                .alias(short_ret_col)
+            )
+
+        df = df.with_columns(ret_cols + short_ret_cols)
+        return df
+
+    # Step 13: Plot long returns by quantile across fill grid
+    def plot_long_returns(self, df: pl.DataFrame) -> None:
+        """
+        Plot mean long returns grouped by rank column quantile for each fill level.
+
+        Input:
+            df (pl.DataFrame): Output of trade_execution(), must contain ret_fill_XX columns
+                               and the quantile column (e.g. q_slope)
+
+        Output:
+            None (displays matplotlib figure)
+        """
+        target_rank_column = f"q_{self.rank_column.lower()}"
+        n_grid = int(os.getenv("N_GRID", "10"))
+        fill_levels = [f"{int(round(f * 100)):02d}" for f in np.linspace(0, 1, n_grid)]
+
+        ncols = 4
+        nrows = math.ceil(len(fill_levels) / ncols)
+
+        fig, axes = plt.subplots(nrows, ncols, figsize=(20, 4 * nrows))
+        plt.style.use('dark_background')
+        fig.suptitle(f"Long Returns by {target_rank_column}", fontsize=14)
+
+        for i, fill in enumerate(fill_levels):
+            ax = axes[i // ncols][i % ncols]
+            target_return_column = f"ret_fill_{fill}"
+
+            data = df.group_by(target_rank_column).agg(
+                pl.col(target_return_column).mean().alias("ret")
+            ).sort(target_rank_column)
+
+            bars = ax.bar(data[target_rank_column], data["ret"], color="darkblue")
+            ax.bar_label(bars, fmt="%.4f", fontsize=6)
+            ax.set_title(target_return_column)
+            ax.set_xlabel(target_rank_column)
+            ax.set_ylabel("ret")
+
+        # hide unused subplots
+        for j in range(len(fill_levels), nrows * ncols):
+            axes[j // ncols][j % ncols].set_visible(False)
+
+        plt.tight_layout()
+        plt.show()
+
+    # Step 14: Plot short returns by quantile across fill grid
+    def plot_short_returns(self, df: pl.DataFrame) -> None:
+        """
+        Plot mean short returns grouped by rank column quantile for each fill level.
+
+        Input:
+            df (pl.DataFrame): Output of trade_execution(), must contain short_ret_fill_XX columns
+                               and the quantile column (e.g. q_slope)
+
+        Output:
+            None (displays matplotlib figure)
+        """
+        target_rank_column = f"q_{self.rank_column.lower()}"
+        n_grid = int(os.getenv("N_GRID", "10"))
+        fill_levels = [f"{int(round(f * 100)):02d}" for f in np.linspace(0, 1, n_grid)]
+
+        ncols = 4
+        nrows = math.ceil(len(fill_levels) / ncols)
+
+        fig, axes = plt.subplots(nrows, ncols, figsize=(20, 4 * nrows))
+        plt.style.use('dark_background')
+        fig.suptitle(f"Short Returns by {target_rank_column}", fontsize=14)
+
+        for i, fill in enumerate(fill_levels):
+            ax = axes[i // ncols][i % ncols]
+            target_return_column = f"short_ret_fill_{fill}"
+
+            data = df.group_by(target_rank_column).agg(
+                pl.col(target_return_column).mean().alias("ret")
+            ).sort(target_rank_column)
+
+            bars = ax.bar(data[target_rank_column], data["ret"], color="darkgreen")
+            ax.bar_label(bars, fmt="%.4f", fontsize=6)
+            ax.set_title(target_return_column)
+            ax.set_xlabel(target_rank_column)
+            ax.set_ylabel("ret")
+
+        # hide unused subplots
+        for j in range(len(fill_levels), nrows * ncols):
+            axes[j // ncols][j % ncols].set_visible(False)
+
+        plt.tight_layout()
+        plt.show()
 
     # Run the full pipeline for the single ticker set on self.ticker
     def _run_single(self) -> pl.DataFrame:
@@ -394,7 +623,8 @@ class constantIVTermStructureEngine:
         worker_args = [
             (t, self.massive_api_key, self.db_path,
              self.options_cfg.__dict__, self.equity_cfg.__dict__,
-             self.max_history_days, self.tenors)
+             self.max_history_days, self.tenors,
+             self.target_frequency, self.rank_column, self.n_tiles)
             for t in self.tickers
         ]
 
@@ -418,13 +648,23 @@ class constantIVTermStructureEngine:
         If ticker is a list, runs in parallel across all CPU cores.
         """
         if len(self.tickers) == 1:
-            return self._run_single()
-        return self._run_parallel()
+            result = self._run_single()
+        else:
+            result = self._run_parallel()
+
+        # Rank cross-sectionally (across all tickers per trade_date)
+        result = self.add_ntile(
+            result,
+            col=self.rank_column,
+            n=self.n_tiles,
+            by="trade_date",
+        )
+        return result
 
 
 def _worker_run_ticker(args: tuple) -> Optional[pl.DataFrame]:
     """Module-level worker function for parallel processing (must be picklable)."""
-    ticker, api_key, db_path, opts_cfg, eq_cfg, max_hist, tenors = args
+    ticker, api_key, db_path, opts_cfg, eq_cfg, max_hist, tenors, freq, rank_col, n_tiles = args
     try:
         engine = constantIVTermStructureEngine(
             ticker=ticker,
@@ -434,6 +674,9 @@ def _worker_run_ticker(args: tuple) -> Optional[pl.DataFrame]:
             equity_filter_config=eq_cfg,
             max_history_days=max_hist,
             tenors=tenors,
+            target_frequency=freq,
+            rank_column=rank_col,
+            n_tiles=n_tiles,
         )
         return engine._run_single()
     except Exception as e:
