@@ -5,7 +5,13 @@
       "WebFetch(domain:ibkrcampus.com)",
       "WebFetch(domain:interactivebrokers.github.io)",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "Bash(.venv/Scripts/pip.exe install:*)"
+      "Bash(.venv/Scripts/pip.exe install:*)",
+      "mcp__massive__list_universal_snapshots",
+      "mcp__massive__get_aggs",
+      "mcp__massive__get_snapshot_option",
+      "mcp__massive__list_treasury_yields",
+      "Bash(/Users/arthurgoh/Desktop/algo-trading/options-scanner-duplicate/data/backtest/treasury_yields.csv:*)",
+      "Bash(git add:*)"
     ]
   }
 }

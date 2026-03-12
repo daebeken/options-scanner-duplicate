@@ -2,14 +2,14 @@
 
 tws:
   host: "127.0.0.1"
-  port: 4001          # 7497=paper TWS, 7496=live TWS, 4001=IB Gateway live, 4002=IB Gateway paper
+  port: 7497          # 7497=paper TWS, 7496=live TWS, 4001=IB Gateway live, 4002=IB Gateway paper
   client_id: 1
 
 # Symbols file: one ticker per line
 symbols_file: "symbols.txt"
 
 # Market data type: 1=live, 2=frozen, 3=delayed, 4=delayed-frozen
-market_data_type: 1
+market_data_type: 3
 
 # Constant maturity IV tenors (days)
 tenors:

@@ -1,3 +1,25 @@
+# =============================================================================
+# Updates (search for # [CHANGED] in the code):
+#
+# Step 7 (_compute_constant_maturity_iv):
+#   - Added cOpra_ST, pOpra_ST: contract names for the expiry closest to the short-term tenor (e.g. 30d)
+#   - Added cOpra_LT, pOpra_LT: contract names for the expiry closest to the long-term tenor (e.g. 180d)
+#   - Added cBidPx_ST, cAskPx_ST, pBidPx_ST, pAskPx_ST: bid/ask prices for the ST contract
+#
+# Step 8 (_join_options_with_cm):
+#   - Passes through ST/LT contract names and ST bid/ask prices from Step 7
+#
+# Step 10 (_compute_derived_columns):
+#   - Added straddle_price_bid_ST, straddle_price_ask_ST, straddle_price_mid_ST:
+#     straddle prices computed from the ST (30d) contract instead of nearest expiry
+#
+# Step 11 (_select_final_and_compute_wret):
+#   - wret now computed on ST straddle prices (straddle_price_bid_ST / straddle_price_ask_ST)
+#     to align the traded contract with the 30d IV signal (SLOPE, IVRV_SLOPE)
+#   - Shift is done .over(["ticker", "cOpra_ST", "pOpra_ST"]) to ensure returns
+#     are computed within each ST option pair contract (null on roll days)
+# =============================================================================
+
 from datetime import date, timedelta, datetime
 from typing import Optional, Dict, Any, List, Union
 from dataclasses import dataclass
@@ -283,12 +305,27 @@ class constantIVTermStructureEngine:
         for (ticker, trade_date), group in atm_df.group_by(["ticker", "trade_date"]):
             group = group.sort("days_to_expiry")
             ivs = _interpolate_group(group)
+
+            # [CHANGED] Find the expiry closest to each tenor (e.g. 30d and 180d)
+            # so we can capture the actual short-term and long-term contract names
+            days = group["days_to_expiry"].to_numpy().astype(float)  # [CHANGED] extract days_to_expiry as numpy array
+            st_idx = int(np.argmin(np.abs(days - tenors[0])))  # [CHANGED] index of expiry closest to short-term tenor (e.g. 30d)
+            lt_idx = int(np.argmin(np.abs(days - tenors[1])))  # [CHANGED] index of expiry closest to long-term tenor (e.g. 180d)
+
             results.append({
                 "ticker": ticker,
                 "expirDate": group["expirDate"][0],
                 "trade_date": trade_date,
                 "cOpra": group["cOpra"][0],
                 "pOpra": group["pOpra"][0],
+                "cOpra_ST": group["cOpra"][st_idx],  # [CHANGED] short-term call contract name (closest to tenors[0])
+                "pOpra_ST": group["pOpra"][st_idx],  # [CHANGED] short-term put contract name (closest to tenors[0])
+                "cOpra_LT": group["cOpra"][lt_idx],  # [CHANGED] long-term call contract name (closest to tenors[1])
+                "pOpra_LT": group["pOpra"][lt_idx],  # [CHANGED] long-term put contract name (closest to tenors[1])
+                "cBidPx_ST": group["cBidPx"][st_idx],  # [CHANGED] ST call bid price for ST straddle pricing
+                "cAskPx_ST": group["cAskPx"][st_idx],  # [CHANGED] ST call ask price for ST straddle pricing
+                "pBidPx_ST": group["pBidPx"][st_idx],  # [CHANGED] ST put bid price for ST straddle pricing
+                "pAskPx_ST": group["pAskPx"][st_idx],  # [CHANGED] ST put ask price for ST straddle pricing
                 "stkPx": group["stkPx"][0],
                 **ivs,
             })
@@ -311,7 +348,9 @@ class constantIVTermStructureEngine:
 
         return joined.select([
             "ticker", "expirDate", "trade_date", "cOpra", "pOpra",
+            "cOpra_ST", "pOpra_ST", "cOpra_LT", "pOpra_LT",  # [CHANGED] pass through ST/LT contract names from Step 7
             "cBidPx", "cAskPx", "pBidPx", "pAskPx",
+            "cBidPx_ST", "cAskPx_ST", "pBidPx_ST", "pAskPx_ST",  # [CHANGED] pass through ST bid/ask prices for ST straddle pricing
             "cVolu", "pVolu", "cOi", "pOi",
             "min_leg_volume", "total_volume", "min_leg_oi", "total_oi",
         ] + tenor_cols)
@@ -350,6 +389,9 @@ class constantIVTermStructureEngine:
             ((pl.col("cAskPx") + pl.col("pAskPx")) - (pl.col("cBidPx") + pl.col("pBidPx"))).alias("spread_abs"),
             (((pl.col("cAskPx") + pl.col("pAskPx")) - (pl.col("cBidPx") + pl.col("pBidPx")))
              / ((pl.col("cBidPx") + pl.col("pBidPx") + pl.col("cAskPx") + pl.col("pAskPx")) / 2)).alias("spread_pct_mid"),
+            (pl.col("cBidPx_ST") + pl.col("pBidPx_ST")).alias("straddle_price_bid_ST"),  # [CHANGED] ST straddle bid = ST call bid + ST put bid
+            (pl.col("cAskPx_ST") + pl.col("pAskPx_ST")).alias("straddle_price_ask_ST"),  # [CHANGED] ST straddle ask = ST call ask + ST put ask
+            ((pl.col("cBidPx_ST") + pl.col("pBidPx_ST") + pl.col("cAskPx_ST") + pl.col("pAskPx_ST")) / 2).alias("straddle_price_mid_ST"),  # [CHANGED] ST straddle mid = avg of ST bid and ask
         )
 
     # Step 11: Final selection + wret
@@ -358,14 +400,16 @@ class constantIVTermStructureEngine:
 
         result = df.select([
             "ticker", "expirDate", "trade_date", "cOpra", "pOpra",
+            "cOpra_ST", "pOpra_ST", "cOpra_LT", "pOpra_LT",  # [CHANGED] include ST/LT contract names in final output
             "cVolu", "pVolu", "cOi", "pOi",
             "min_leg_volume", "total_volume", "min_leg_oi", "total_oi",
             "dollar_vol", "SLOPE", "IVRV_SLOPE",
             "straddle_price_bid", "straddle_price_ask", "straddle_price_mid",
+            "straddle_price_bid_ST", "straddle_price_ask_ST", "straddle_price_mid_ST",  # [CHANGED] include ST straddle prices in final output
             "spread_abs", "spread_pct_mid",
         ]).with_columns(
-            (pl.col("straddle_price_bid").shift(-shift_n).over("ticker")
-             / pl.col("straddle_price_ask") - 1).alias("wret"),
+            (pl.col("straddle_price_bid_ST").shift(-shift_n).over(["ticker", "cOpra_ST", "pOpra_ST"])  # [CHANGED] wret now computed on ST straddle prices, within each ST option pair contract (aligned with 30d IV signal)
+             / pl.col("straddle_price_ask_ST") - 1).alias("wret"),
         )
 
         return result
@@ -423,7 +467,9 @@ class constantIVTermStructureEngine:
         spread_choice = os.getenv("SPREAD_CHOICE", "PARTIAL")
 
         # select relevant columns
-        df = df.select("ticker", "expirDate", "trade_date", "cOpra", "pOpra", "straddle_price_bid", "straddle_price_ask", "straddle_price_mid", "q_slope")
+        df = df.select("ticker", "expirDate", "trade_date", "cOpra", "pOpra",
+                        "cOpra_ST", "pOpra_ST",  # [CHANGED] include ST contract names for downstream trading
+                        "straddle_price_bid", "straddle_price_ask", "straddle_price_mid", "q_slope")
 
         # Compute next-day straddle prices per ticker
         df = df.with_columns([

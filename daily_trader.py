@@ -6,6 +6,19 @@
 # at 3:59 PM to close.
 # =============================================================================
 #
+# Updates (search for # [CHANGED] in the code):
+#
+# run_pipeline:
+#   - Displays cOpra_ST/pOpra_ST (30d tenor contracts) instead of cOpra/pOpra (nearest expiry)
+#
+# open_straddles:
+#   - Now buys cOpra_ST/pOpra_ST instead of cOpra/pOpra, so the traded contract
+#     is aligned with the 30d IV signal (SLOPE, IVRV_SLOPE)
+#
+# close_straddles:
+#   - Sells the same ST contracts that were opened
+# =============================================================================
+#
 # Usage:
 #   Production (full day schedule):  python daily_trader.py
 #     - 9:20 AM ET: runs data pipeline (~5 min)
@@ -235,7 +248,7 @@ class DailyTrader:
         n = len(self.decile10_df)
         print(f"[{now_str()}] Pipeline complete. {n} decile-10 straddles to trade:")
         for row in self.decile10_df.iter_rows(named=True):
-            print(f"  {row['ticker']}: call={row['cOpra']}  put={row['pOpra']}")
+            print(f"  {row['ticker']}: call={row['cOpra_ST']}  put={row['pOpra_ST']}")  # [CHANGED] display ST contracts instead of nearest-expiry
 
     def connect_tws(self):
         """Establish persistent TWS connection."""
@@ -255,8 +268,8 @@ class DailyTrader:
 
         for row in self.decile10_df.iter_rows(named=True):
             ticker = row["ticker"]
-            c_opra = row["cOpra"]
-            p_opra = row["pOpra"]
+            c_opra = row["cOpra_ST"]  # [CHANGED] trade ST call contract (aligned with 30d IV signal)
+            p_opra = row["pOpra_ST"]  # [CHANGED] trade ST put contract (aligned with 30d IV signal)
 
             call_oid = self.client.submit_option_order(c_opra, "BUY", self.quantity)
             put_oid = self.client.submit_option_order(p_opra, "BUY", self.quantity)
@@ -302,12 +315,12 @@ class DailyTrader:
 
         for pos in self.open_positions:
             if pos["call_buy"]["status"] == "Filled":
-                oid = self.client.submit_option_order(pos["cOpra"], "SELL", self.quantity)
+                oid = self.client.submit_option_order(pos["cOpra"], "SELL", self.quantity)  # [CHANGED] cOpra now stores cOpra_ST
                 sell_tasks.append((pos, "call", oid))
                 all_oids.append(oid)
 
             if pos["put_buy"]["status"] == "Filled":
-                oid = self.client.submit_option_order(pos["pOpra"], "SELL", self.quantity)
+                oid = self.client.submit_option_order(pos["pOpra"], "SELL", self.quantity)  # [CHANGED] pOpra now stores pOpra_ST
                 sell_tasks.append((pos, "put", oid))
                 all_oids.append(oid)
 
@@ -416,8 +429,8 @@ def main():
     print(f"TWS: {host}:{port} (client_id={CLIENT_ID})")
     print(f"{'=' * 60}")
 
-    # Phase 1: 9:20 AM — Run pipeline
-    wait_until(9, 20)
+    # Phase 1: 9:15 AM — Run pipeline
+    wait_until(9, 15)
     print(f"\n[{now_str()}] === PHASE 1: Running data pipeline ===")
     trader.run_pipeline()
 
