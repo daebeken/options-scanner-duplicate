@@ -11,7 +11,8 @@
       "mcp__massive__get_snapshot_option",
       "mcp__massive__list_treasury_yields",
       "Bash(/Users/arthurgoh/Desktop/algo-trading/options-scanner-duplicate/data/backtest/treasury_yields.csv:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
     ]
   }
 }

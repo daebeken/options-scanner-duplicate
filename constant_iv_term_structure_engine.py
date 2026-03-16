@@ -102,6 +102,7 @@ class constantIVTermStructureEngine:
         rank_column: Optional[str] = None,
         n_tiles: Optional[int] = None,
         auto_sync: bool = True,
+        as_of_date: Optional[date] = None,
     ) -> None:
         if isinstance(ticker, str):
             self.tickers = [ticker.upper()]
@@ -120,6 +121,13 @@ class constantIVTermStructureEngine:
         self.n_tiles = n_tiles or int(os.getenv("N_TILES", "10"))
 
         self.auto_sync = auto_sync
+
+        # as_of_date: explicit param > .env AS_OF_DATE > today
+        if as_of_date is not None:
+            self.as_of_date = as_of_date
+        else:
+            env_date = os.getenv("AS_OF_DATE", "").strip()
+            self.as_of_date = date.fromisoformat(env_date) if env_date else date.today()
 
         self.options_cfg = self._build_config(OptionsFilterConfig, options_filter_config)
         self.equity_cfg = self._build_config(EquityFilterConfig, equity_filter_config)
@@ -143,7 +151,7 @@ class constantIVTermStructureEngine:
     # Step 0: Sync ORATS cache so options data is up to date
     def _sync_orats_cache(self) -> None:
         """Sync the ORATS DuckDB cache for the current and previous year."""
-        year = date.today().year
+        year = self.as_of_date.year
         print("[SYNC] Syncing ORATS cache...")
         with ExtractOratsEngine(db_path=self.db_path) as orats:
             for y in [year - 1, year]:
@@ -152,10 +160,10 @@ class constantIVTermStructureEngine:
 
     # Step 1: Fetch equity data from Massive API
     def _fetch_equity_data(self) -> pl.DataFrame:
-        today = date.today().strftime("%Y-%m-%d")
+        today = self.as_of_date.strftime("%Y-%m-%d")
         previous = max(
             date(1970, 1, 1),
-            date.today() - timedelta(days=self.max_history_days),
+            self.as_of_date - timedelta(days=self.max_history_days),
         ).strftime("%Y-%m-%d")
 
         client = self._get_client()
@@ -188,16 +196,17 @@ class constantIVTermStructureEngine:
 
     # Step 2: Fetch options data from DuckDB
     def _fetch_options_data(self) -> pl.DataFrame:
-        year = date.today().year
+        year = self.as_of_date.year
         tables = [f"options_data_{y}" for y in [year - 1, year]]
         ticker_sql = f"'{self.ticker}'"
+        as_of_sql = self.as_of_date.strftime("%Y-%m-%d")
 
         con = duckdb.connect(self.db_path, read_only=True)
         try:
             union_query = " UNION ALL ".join(f"SELECT * FROM {t}" for t in tables)
             df = pl.from_pandas(con.execute(f"""
                 SELECT * FROM ({union_query})
-                WHERE expirDate >= CURRENT_DATE
+                WHERE expirDate >= '{as_of_sql}'
                 AND ticker IN ({ticker_sql})
             """).fetchdf())
         finally:
@@ -265,7 +274,7 @@ class constantIVTermStructureEngine:
         return options_df.with_columns(
             ((pl.col("strike") - pl.col("stkPx")).abs()).alias("atm_diff"),
             ((pl.col("cMidIv") + pl.col("pMidIv")) / 2).alias("atm_iv"),
-            (pl.col("expirDate").cast(pl.Date) - pl.lit(datetime.now().date()))
+            (pl.col("expirDate").cast(pl.Date) - pl.lit(self.as_of_date))
                 .dt.total_days().alias("days_to_expiry"),
             pl.min_horizontal("cVolu", "pVolu").alias("min_leg_volume"),
             (pl.col("cVolu") + pl.col("pVolu")).alias("total_volume"),
@@ -684,7 +693,8 @@ class constantIVTermStructureEngine:
             (t, self.massive_api_key, self.db_path,
              self.options_cfg.__dict__, self.equity_cfg.__dict__,
              self.max_history_days, self.tenors,
-             self.target_frequency, self.rank_column, self.n_tiles)
+             self.target_frequency, self.rank_column, self.n_tiles,
+             self.as_of_date)
             for t in self.tickers
         ]
 
@@ -707,6 +717,9 @@ class constantIVTermStructureEngine:
         If ticker is a single string, runs sequentially.
         If ticker is a list, runs in parallel across all CPU cores.
         """
+        if self.as_of_date != date.today():
+            print(f"[INFO] Running as-of date: {self.as_of_date} (override active)")
+
         if self.auto_sync:
             self._sync_orats_cache()
 
@@ -727,7 +740,7 @@ class constantIVTermStructureEngine:
 
 def _worker_run_ticker(args: tuple) -> Optional[pl.DataFrame]:
     """Module-level worker function for parallel processing (must be picklable)."""
-    ticker, api_key, db_path, opts_cfg, eq_cfg, max_hist, tenors, freq, rank_col, n_tiles = args
+    ticker, api_key, db_path, opts_cfg, eq_cfg, max_hist, tenors, freq, rank_col, n_tiles, as_of_date = args
     try:
         engine = constantIVTermStructureEngine(
             ticker=ticker,
@@ -741,6 +754,7 @@ def _worker_run_ticker(args: tuple) -> Optional[pl.DataFrame]:
             rank_column=rank_col,
             n_tiles=n_tiles,
             auto_sync=False,  # sync already done in main process
+            as_of_date=as_of_date,
         )
         return engine._run_single()
     except Exception as e:

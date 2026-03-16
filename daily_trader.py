@@ -236,7 +236,9 @@ class DailyTrader:
         print(f"[{now_str()}] Running engine for {len(tickers)} tickers...")
 
         auto_sync = os.getenv("AUTO_SYNC", "true").lower() == "true"
-        engine = constantIVTermStructureEngine(ticker=tickers, auto_sync=auto_sync)
+        env_date = os.getenv("AS_OF_DATE", "").strip()
+        as_of_date = date.fromisoformat(env_date) if env_date else None
+        engine = constantIVTermStructureEngine(ticker=tickers, auto_sync=auto_sync, as_of_date=as_of_date)
         result = engine.run()
 
         # Filter for latest trade_date, decile 10 only
